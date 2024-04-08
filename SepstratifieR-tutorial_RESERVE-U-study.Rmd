@@ -1,0 +1,366 @@
+---
+title: "Statifying patients in the RESERVE-U study by SRS/SRSq"
+author: "Kiki Cano-Gamez <kiki.canogamez@well.ox.ac.uk>"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+## Background
+
+This tutorial demonstrate how to use the SepstratifieR algorithm to classify patients into SRS groups and predict their SRSq value. It uses as a case study an RNA-sequencing data set of sepsis patients recruited in Uganda, which is part of the RESERVE-U study.
+
+For more information on the clinical characteristics of this cohort and on how these data were generated, please refer to the 2024 publication by Cummings et al.: http://doi.org/10.1097/CCM.0000000000006023 
+
+
+## Loading libraries
+
+Before starting any analyses, you'll need to make sure all the required libraries are installed. To install all necessary libraries, along with their dependencies, please run the following code block:
+```{r install_libraries, eval=FALSE}
+# CRAN packages
+install.packages("tidyverse")
+install.packages("cowplot")
+install.packages("ggExtra")
+install.packages("ggpubr")
+install.packages("ggrepel")
+
+# Bioconductor packages
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("SummarizedExperiment")
+BiocManager::install("limma")
+BiocManager::install("batchelor")
+BiocManager::install("MatrixGenerics")
+
+# GitHub packages
+devtools::install_github("stephenturner/annotables")
+devtools::install_github("jknightlab/SepstratifieR")
+```
+
+Now you should be able to successfully load these libraries:
+```{r load_libraries, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(SummarizedExperiment)
+library(annotables)
+library(SepstratifieR)
+library(limma)
+library(cowplot)
+library(ggExtra)
+library(ggpubr)
+library(ggrepel)
+```
+
+## Reading in data
+To complete this tutorial, you will need to download the counts table from the RESERVE-U study. This table is an expression matrix containing raw counts for each gene, as measured using RNA-seq and quantified bioinformatically. The file is available through the GitHub repository designed for this workshop. Once you have downloaded it, make sure to copy this file to your project directory so that R can find it.
+
+We proceed to load the counts table using the read.table() function
+```{r load_data, message=FALSE, warning=FALSE}
+RESERVEU_gex <- read.table(
+  "./RESERVE_U_1_counts_normalized_adult.csv",
+  sep=";", header=T, row.names = 1
+  )
+```
+
+The first few lines of this table look as follows:
+```{r preview_gex_table, message=FALSE, warning=FALSE}
+RESERVEU_gex[1:10,1:10]
+```
+
+## Formatting data
+While this table already contains all the information we need, its format could be improved and made a lot more informative. Thus, we will transform this data into a format specifically designed for gene expression analysis called a 'SummarizedExperiment'.
+
+A SummarizedExperiment is a data structure which contains three components:
+
+- The data itself (usually a counts table with genes as rows and samples as columns)
+- A table with annotations for each gene in the study (for example, the gene's name, genomic position, gene type, etc...)
+- A table with annotations for each sample in the study (for example, demographic information or phenotype information)
+
+### Creating gene annotations
+We start by compiling annotations for each of the genes in our expression table. To do so, we will make use of the "Annotables" library, which retrieves information from Ensembl and distributes it in a format which is easy to plug into R.
+
+We start by finding out which genes in the RESERVE-U RNA-seq experiment have annotations available in the Ensembl (specifically, an Ensembl version which matches the GRCh38 reference genome). We will subset our expression table to only include annotated genes, removing any rows which lack Ensembl annotations:
+```{r subset_to_annotated_genes, message=FALSE, warning=FALSE}
+annotated_genes <- unique(intersect(grch38$symbol, rownames(RESERVEU_gex)))
+RESERVEU_gex <- RESERVEU_gex[annotated_genes,]
+```
+
+Next, we fetch the Ensembl annotations for each of the genes in our table. The annotations we are interested in are: gene ID (i.e. Ensembl ID), gene name (i.e. common name from HUGO), chromosome, starting and ending position of the gene, as well as gene family (e.g. protein coding, non-coding RNA, miRNA, etc...). We reformat this information into a suitable format using tidyverse, and then match the order of rows between our counts table and gene annotations table, as shown in the following code block.
+```{r fetch_gene_annotations, message=FALSE, warning=FALSE}
+gene_annotations <- data.frame(
+  grch38 %>% 
+    filter(symbol %in% annotated_genes) %>%
+    filter(!duplicated(symbol)) %>%
+    transmute(gene_id = ensgene,
+              gene_name = symbol,
+              chr = chr,
+              start = start,
+              end = end,
+              biotype = biotype)
+  )
+rownames(gene_annotations) <- gene_annotations$gene_name
+gene_annotations <- gene_annotations[rownames(RESERVEU_gex),]
+```
+
+The final gene annotations table looks as follows: 
+```{r preview_gene_anns, message=FALSE, warning=FALSE}
+head(gene_annotations)
+```
+
+Finally, we set the rows of both our tables (expression matrix and gene annotations) to be the Ensembl gene IDs. This is important, because SepstratifieR identifies the genes needed for SRS prediction based on their Ensembl IDs. It's important to note that row names must match between these two tables in order for us to successfully create a SummarizedExperiment. 
+```{r set_gene_ids_as_rownames, message=FALSE, warning=FALSE}
+rownames(gene_annotations) <- gene_annotations$gene_id
+rownames(RESERVEU_gex) <- rownames(gene_annotations)
+```
+
+### Normalising and log-transforming expression data
+RNA-seq counts are significantly affected by sequencing depth (i.e. how many reads were generated in total for that sample during sequencing), which can generate systematic biases between samples if they have widely different coverage. This, we will normalise our counts table by the total sequencing depth of each sample. To make these numbers more manageable, we multiply them by 1,000,000. This normalisation strategy generates so called "counts per million reads (cpm)".
+```{r cpm_normalize, message=FALSE, warning=FALSE}
+RESERVEU_gex <- (RESERVEU_gex*1e6)/colSums(RESERVEU_gex)
+```
+
+RNA-seq counts tend to span a dynamic range, which means lowly expressed genes have dozens of counts while highly expressed genes can have hundreds to thousands of counts. This causes the distribution of gene counts to have a dramatic right-tail skew, which precludes us from using any method that relies on a normal or "quasi-normal" distribution. 
+
+To get around this issue, we apply a log transformation to the data. Bringing counts to a logarithmic scale causes them to fall into a distribution that is much closer to the normal/Gaussian distribution.
+```{r log_transform, message=FALSE, warning=FALSE}
+RESERVEU_gex <- log(RESERVEU_gex + 1)
+```
+
+The final gene expression unit is thus log-CPMs.
+
+### Creating Summarized Experiment
+Now that we have our data in the right format and scale, alongside suitable gene annotations, we can create a SummarizedExperiment object.
+
+We do this by combining both of these data sets together into a single object.
+```{r create_summarized_experiment, message=FALSE, warning=FALSE}
+RESERVEU <- SummarizedExperiment(
+  assays = RESERVEU_gex,
+  rowData = gene_annotations
+  )
+```
+
+The final SummarizedExperiment object looks as follows:
+```{r preview_SummarizedExperiment, message=FALSE, warning=FALSE}
+RESERVEU
+```
+
+### Gene filtering
+It is common practice in RNA-seq analysis to remove genes which are too lowly expressed to provide any useful information. There are a variety of ways to do this. Here, we will use a simple hard threshold and only keep genes which show at least 1 log-CPM (2.7 CPMs) in 10 or more samples.
+```{r filter_genes, message=FALSE, warning=FALSE}
+RESERVEU <- RESERVEU[rowSums(assay(RESERVEU) > 1) > 10,]
+```
+
+We are now ready to start analysis
+
+## Exploratory analysis
+Before performing stratification, it is a good idea to explore the data and make sure there are no systematic biases or batch effects which need to be corrected for. Here, we will do that by using principal component analysis (PCA) and related visualisation techniques.
+
+### Dimensionality reduction and visualisation
+We use the built in PCA function in base R (prcomp) to obtain principal components for this data. Note that prcomp() expects our variables (i.e. genes) to be encoded as columns, but out expression table has them as rows. Thus, the expression matrix needs to be transposed with the t() function before PCA computation.
+```{r perform_pca, message=FALSE, warning=FALSE}
+pca_res <- prcomp(t(assay(RESERVEU)))
+```
+
+We can now retrieve both the PCA coordinates of each sample as well as the amount of variation explained by each component.
+```{r fetch_pc_coords, message=FALSE, warning=FALSE}
+pc_coords <- data.frame(cbind(pca_res$x, colData(RESERVEU)))
+pc_vars <- round(pca_res$sdev^2/sum(pca_res$sdev^2)*100,2)
+```
+
+The following screeplot shows the amount of variance captured by each of the first 50 principal components.
+```{r plot_variance_explained_per_pc, message=FALSE, warning=FALSE, echo=FALSE}
+plot(pc_vars[1:50], 
+     type="b", cex=0.5, 
+     xlab="Principal Component", 
+     ylab="Proportion of variance explained")
+```
+
+It is clear from this visualisation that most of the variation in the data set is captured by the first 5 principal components. 
+
+When focusing on the first two components (PC1 and PC2), samples look as follow in PCA space:
+```{r plot_pca, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) +
+  geom_point(color="steelblue", size=3) +
+  xlab(paste("PC1: ", pc_vars[1], "% variance", sep="")) +
+  ylab(paste("PC1: ", pc_vars[2], "% variance", sep="")) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+```
+
+It is hard to understand what is driving this variation, as we don't have information on the different samples. However, there does not seem to be evidence of any strong batch effects, which would show up here as completely separate groups of points.
+
+Thus, this data does not show evidence of evident biases or batch effects, and we can now proceed to stratifying these patients into sepsis endotypes.
+
+## Stratification of patients by SRS
+We will use SepstratifieR to predict both SRS endotype and SRSq score for each patient in the RESERVE-U study. SepstratifieR uses a two step process to predict SRS labels:
+
+- It first aligns the data of interest to a reference set (mostly formed of GAinS RNA-seq samples and healthy volunteer RNA-seq samples) based on a set of 19 predictor genes
+- It then uses the aligned data as input for a machine learning prediction model, which outputs SRS and SRSq predictions.
+
+For more information on the inner workings of SepstratifieR, please refer to its associated GitHub, where more extensive documentation is available: https://github.com/jknightlab/SepstratifieR 
+
+SepstratifieR takes as an input a data frame with variables (i.e. genes) as columns and samples as rows. Thus, we will need to extract the expression table from our SummarizedExperiment object and transpose it before feeding this data to SepstratifieR. SepstratifieR uses an exact match of gene IDs to find the predictor genes, which is why genes should be labelled according to their Ensembl ID.
+
+Let's proceed to predictiong SRS endotype and SRSq scores for each sample in our data set:
+```{r stratify_samples, message=FALSE, warning=FALSE}
+SRS_predictions <- stratifyPatients(
+  data.frame(t(assay(RESERVEU))),
+  k=20,
+  gene_set = "extended"
+  )
+```
+
+The output from SepstratifieR is a "SepsisPrediction" object containing a variety of information, such as the original data used for prediction, the data after alignment to the reference, and the predicted SRS and SRSq labels. This object looks as follows:
+```{r preview_SRS_predictions, message=FALSE, warning=FALSE}
+SRS_predictions
+```
+
+We can get a sense of the frequency of each SRS group in this cohort is as follows:
+```{r tabulate_SRS_frequencies, message=FALSE, warning=FALSE}
+table(SRS_predictions@SRS)
+```
+
+In this case, around 78% of patients get assigned to SRS2, with the remaining 17% assigned to SRS1 and only 4% predicted to be SRS3. This aligns with the expected SRS distribution in the septic population.
+
+SepstratifieR also contains a number of auxiliary methods to aid interpretation and help the user assess how reliable SRS predictions are. We will start by plotting where the RESERVE-U samples map with respect to the reference GAinS data used by SepstratifieR. In this plot, the small background dots represent SepstratifieR's reference (GAinS + controls), and the bigger dots in the foreground represent the RESERVE-U patients. We would expect RESERVE-U patients to fall on top of the reference points. If this were not the case (for example, RESERVE-U points forming an entirely separate population or being grossly misaligned), then we would need to go back and check if any of the assumptions of this analysis are violated. 
+
+Encouragingly, the samples in RESERVE-U seem well aligned with the reference used by SepstratifieR.
+```{r plot_sample_alignment, message=FALSE, warning=FALSE}
+plotAlignedSamples(SRS_predictions)
+```
+
+SepstratifieR can also perform a sensitivity analysis, with the aim of assessing how much predictions tend to differ when we change the value of the internal 'k' parameter used by the algorithm. This parameter corresponds to the number of nearest beighbours used to align the query data to the reference data, and can often have a big impact on the final predictions. 
+
+This SepstratifieR function computes SRS and SRSq predictions accross a range of 'k' values, and then produces visualisations that enable us to assess how stable or unstable these predictions tend to be over the 'k' range:
+```{r run_sensititivy_analysis, message=FALSE, warning=FALSE}
+sensitivity_res <- runSensitivityAnalysis(data.frame(t(assay(RESERVEU))), verbose = T, gene_set = "extended")
+```
+
+In this case, we see that SRSq predictions stabilise for 'k' values above 20, with little variation thereafter. The second plot shows this variation more quantitatively as a variance. Most predictions show very little variation.
+
+Thus, based on these two sanity checks, we can conclude that SepstratifieR predictions for this cohort are stable and reliable.
+
+We now add the predictions from SepstratifieR as metadata to our original Summarized Experiment object:
+```{r add_SRS_to_metadata, message=FALSE, warning=FALSE}
+RESERVEU$SRS <- SRS_predictions@SRS
+RESERVEU$SRSq <- SRS_predictions@SRSq
+```
+
+### Visualisation of predicted endotypes
+Let's now assess whether the predicted SRS labels correlate with the variation captured in any of the top principal components. We combine our SRS + SRSq predictions with our PCA coordiantes in a single table, which we can then use for visualisations.
+```{r combine_pcs_and_SRS_preds, message=FALSE, warning=FALSE}
+pc_coords <- data.frame(cbind(pca_res$x,colData(RESERVEU)))
+```
+
+
+PCA reveals that the SRS signature correlates strongly with the first principal component. This tells us that SRS is amongst the top causes of variation in this data, and that it goes beyond just the 19 genes used for prediction.
+```{r plot_pca_by_SRS, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(data=pc_coords, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+ggMarginal(g1, type = "density", groupFill = T)
+
+ggplot(data=pc_coords, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=SRSq), size=3) +
+  scale_color_gradient2(low = "lightgrey", mid = "steelblue", high = "darkblue", midpoint = 0.5) +
+  theme_classic()
+```
+
+## Identifying SRS-associated gene expression programs
+We now that SRS is a transcriptomic phenotype which is formed of many correlated genes, not just the 19 genes used for prediction. Thus,let's now assess if any other genes tend to vary with SRS by performing differential gene expression testing.
+
+There are many methods for differential expression testing. Here, we will use limma, which was originally developed for microarray analysis but is also applicable to RNA-seq data. Limma performs moderated t-tests, followed by multiple testing correction.
+
+We start by defining a model matrix for our comparison of interest. In this case, we define SRSq as the independent variable in the model. 
+```{r define_design_matrix, message=FALSE, warning=FALSE}
+design_matrix <- model.matrix(~RESERVEU$SRSq)
+```
+
+We then test for an association between gene expression level and SRSq using the lmFit and eBayes functions.
+```{r test_for_differential_expression, message=FALSE, warning=FALSE}
+fit <- lmFit(assay(RESERVEU), design_matrix)
+fit2 <- contrasts.fit(fit, coef = 2)
+fit2 <- eBayes(fit2)
+```
+
+Finally, we retrieve the relevant statistics for any differentially expressed genes from the fit object. For the purposes of this workshop, we will define differentially expressed genes as any gene with an absolute fold change of 3.5 or higher at an FDR of 0.05. A fold-change of 3.5 is approximately equivalent to a 1-fold increase in gene expression for every 0.3-unit increase in SRSq. 
+
+```{r extract_DE_genes, message=FALSE, warning=FALSE}
+DEGs <- topTable(fit2, adjust="BH", number = nrow(RESERVEU))
+DEGs$gene_id <- rownames(DEGs)
+DEGs$gene_name <- rowData(RESERVEU)[DEGs$gene_id,]$gene_name
+DEGs$DE <- abs(DEGs$logFC) >= log2(3.5) & DEGs$adj.P.Val <= 0.05
+```
+
+A volcano plot representation of differentialy expressed genes looks as follows:
+```{r create_volcano_plot, message=FALSE, warning=FALSE, echo=FALSE}
+top_genes <- c(rownames(DEGs[DEGs$DE==T & DEGs$logFC > 0,])[1:15],
+               rownames(DEGs[DEGs$DE==T & DEGs$logFC < 0,])[1:10])
+
+ggplot(DEGs, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs, aes(color=DE)) +
+  geom_label_repel(data=DEGs[top_genes,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRSq-associated genes\n", "(Microarray cohort)")) +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+```
+
+Below are some example genes known to be differentially expressed between SRS groups based on our previous work in the GAinS cohort.
+```{r create_volcano_plot_example_genes, message=FALSE, warning=FALSE, echo=FALSE}
+example_genes <- c("EMR3","GZMK","CD27","GZMH","CCR3","HLA-DMB","HLAC","CD6","CD177","MMP8","HPGD","TDRD9","GPR84","TNFAIP8L3")
+
+ggplot(DEGs, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs, aes(color=DE)) +
+  geom_label_repel(data=DEGs[DEGs$gene_name %in% example_genes,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRSq-associated genes\n", "(Microarray cohort)")) +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+```
+
+The top SRSq-associated genes identified in GAinS look as follows in RESERVE-U:
+```{r plot_gex_vs_SRSq_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+gains_top_genes <- c("DYSF","RAB31","ALOX5","SLC25A38","AGFG2","PDCD11")
+cat(round(mean(gains_top_genes %in% DEGs$gene_name[DEGs$adj.P.Val < 0.05])*100,2),
+    "% of top SRSq-associated genes in GAinS also pass FDR correction in COMBAT\n", sep="")
+
+par(mfrow=c(2,3))
+for(i in intersect(gains_top_genes,DEGs$gene_name)){
+  gene_id <- rowData(RESERVEU)$gene_id[rowData(RESERVEU)$gene_name == i]
+  print(
+    plot(RESERVEU$SRSq,
+     assay(RESERVEU[gene_id,]),
+     col = RESERVEU$SRS,
+     main=i,
+     xlab="SRSq",
+     ylab="Log-transformed expression",
+     pch=19)
+  )
+}
+```
+
+## Exporting results
+Finally, we can export the SummarizedExperiment object containig our SRS predictions an RDS file for future reference:
+```{r export_as_rds, eval=FALSE}
+saveRDS(RESERVEU, "../../data/RESERVE-U_Uganda/RESERVE-U_gex_log2-scale.rds")
+write.table(colData(RESERVEU), "../../data/RESERVE-U_Uganda/RESERVE-U_SRS-assignments_19-gene-signature.tsv", sep = "\t", quote=F, row.names = T)
+```
+
+## R session details
+```{r r_session, message=FALSE, warning=FALSE}
+sessionInfo()
+```
